@@ -15,7 +15,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-COPY policy_server.py scripted_policy.py ./
+COPY policy_server.py scripted_policy.py task_parser.py ./
 
 # Drop privileges: the platform runs with --cap-drop ALL --security-opt no-new-privileges;
 # port 8000 is unprivileged, and the server logs to stdout only.

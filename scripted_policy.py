@@ -30,6 +30,8 @@ from positronic_model_server.serialization import DEFAULT_JPEG_QUALITY, check_in
 from positronic_model_server.server import Model, Session
 from positronic_model_server.spec import component, parallel, sequence
 
+from task_parser import CONTAINERS, SKILL_MOVE_DIR, SKILL_PLACE, SURFACES, parse_task_text
+
 logger = logging.getLogger(__name__)
 
 # Observation keys (flat strings; dots are literal — docs/connect-your-model.md:114-131).
@@ -90,10 +92,23 @@ HOLD_AFTER_TASK_BUDGET = 30  # chunks to keep serving a finished task before end
 ERROR_BUDGET = 6  # consecutive error-status chunks before give_up
 EPISODE_BUDGET = 100  # chunks total, safety net against a livelock
 
-PLACE_INTENT_WORDS = (
-    'place', 'put', 'into', 'inside', 'on', 'onto', 'bin', 'box', 'basket', 'bowl',
-    'drop', 'left', 'right', 'corner', 'table', 'location', 'area', 'surface',
-)
+# --- task-grammar extensions (task_parser.parse_task_text drives these) -------------
+DQ = 'robot_state.dq'  # optional per contract; when absent the FSM falls back to position stall
+# Drawer skill: the cabinet is assumed in front of the start pose (+X — the same blind
+# guess as CARRY_OFFSET below); the wrist camera may refine the handle if it sees one.
+HANDLE_FORWARD = 0.28  # metres from the start xy to the nominal drawer-handle point
+HANDLE_HEIGHT_DROP = 0.05  # metres below the cruise height
+DRAWER_STEP = 0.03  # metres per chunk along the drawer axis
+DRAWER_ACT_BUDGET = 14  # chunks of pulling/pushing before stopping without a clear stall
+DQ_STALL_NORM = 0.06  # L2 |dq| (rad/s) below which the arm counts as not moving
+EE_STALL_MOVE = 0.004  # metres: less than this per chunk means stalled (when dq is absent)
+STALL_CHUNKS = 3  # consecutive stalled chunks = end-of-travel signal (min. 2 motion chunks first)
+DRAWER_REGRASP = 1  # grip-lost / failed-closure retries inside the drawer skill
+# Place targets by relation; all horizontal axis meanings carry the CARRY_OFFSET caveat
+# (screen left/right cannot be resolved to a world axis without camera extrinsics).
+PLACE_LATERAL = 0.15  # metres for 'left'/'right' targets
+BIN_RELEASE_DROP = 0.10  # into-container: release this far below the cruise height
+PLATE_HEIGHT = 0.02  # onto-plate/onto-pot: table height + this
 # HSV ranges (OpenCV H in [0, 180]). Red wraps, hence two ranges.
 COLOR_RANGES: dict[str, tuple[np.ndarray, np.ndarray]] = {
     'red': (np.array([0, 70, 50]), np.array([10, 255, 255])),
@@ -139,11 +154,29 @@ def detect_blob(image: np.ndarray, color: str | None) -> tuple[float, float, flo
 
 
 def parse_task(task: str) -> tuple[str | None, bool]:
-    """Extract the object colour and whether a place action is requested from the task text."""
-    text = (task or '').lower()
-    color = next((name for name in ('red', 'green', 'blue', 'yellow') if name in text), None)
-    place = any(word in text for word in PLACE_INTENT_WORDS)
-    return color, place
+    """Legacy colour + place-intent probe, now a thin wrapper over the task grammar.
+
+    The FSM itself uses :func:`task_parser.parse_task_text` (skill/object/target); this
+    helper only preserves the old two-value contract for any external caller.
+    """
+    intent = parse_task_text(task)
+    return intent['color'], intent['skill'] in (SKILL_PLACE, SKILL_MOVE_DIR)
+
+
+def detect_blob_soft(image: np.ndarray | None, color: str | None) -> tuple[float, float, float] | None:
+    """``detect_blob`` that never raises: drawer vision is a refinement, not a requirement.
+
+    Returns ``None`` when the image is unusable (missing key, detector failure — e.g. a
+    stubbed cv2 in unit tests) or no blob matches; the drawer skill then falls back to
+    the blind nominal handle point.
+    """
+    if image is None:
+        return None
+    try:
+        return detect_blob(image, color)
+    except Exception:  # noqa: BLE001 - any detector failure degrades to the blind path
+        logger.debug('scripted policy: wrist blob detection failed, using the blind path', exc_info=True)
+        return None
 
 
 def normalize_quat(quat: np.ndarray) -> np.ndarray:
@@ -187,6 +220,21 @@ class PickStateMachine:
         self.chunk_count = 0
         self.want_place = False
         self.color: str | None = None
+        # Task-grammar intent (task_parser.parse_task_text): skill/target for place and
+        # the drawer bookkeeping below.
+        self.place_target: str | None = None
+        self.drop_xy: np.ndarray | None = None
+        self.place_z: float | None = None
+        self.drawer_mode: str | None = None  # 'open' | 'close'
+        self.drawer_phase = ''  # 'lateral' | 'vertical' inside drawer_approach
+        self.handle_xy = np.zeros(2)
+        self.handle_z = 0.0
+        self.pull_dir = np.zeros(2)
+        self.pull_start = np.zeros(2)
+        self.drawer_regrasps = 0
+        self.drawer_steps = 0
+        self.stall_run = 0
+        self.prev_drawer_xy: np.ndarray | None = None
 
     # -- helpers ----------------------------------------------------------
 
@@ -208,15 +256,25 @@ class PickStateMachine:
             t = i / max(1, steps - 1)
             xyz = ee[:3] + (target[:3] - ee[:3]) * t
             vec = np.concatenate([xyz, target[3:], [grip]]).astype(np.float32)
+            # any non-finite component makes the client discard the whole chunk
+            if not np.isfinite(vec).all():
+                vec = np.nan_to_num(vec, nan=0.0, posinf=6.0, neginf=-6.0)
             element: dict[str, Any] = {ACTION_FIELD: vec}
             if end is not None:
                 element['end'] = end
             elements.append(element)
+        if not elements:
+            # defensive: always emit at least one hold element
+            vec = np.concatenate([ee[:3], target[3:], [grip]]).astype(np.float32)
+            elements.append({ACTION_FIELD: np.nan_to_num(vec, nan=0.0, posinf=6.0, neginf=-6.0)})
         return elements
 
     # -- main entry -------------------------------------------------------
 
     def step(self, observation: dict[str, Any], fps: float, steps: int) -> list[dict[str, Any]]:
+        # Platform hardening (submission 6482ea4f… robolab episode): a chunk with
+        # zero elements is unusable for the client — never emit one.
+        steps = max(1, int(steps))
         self.chunk_count += 1
         if self.chunk_count > EPISODE_BUDGET:
             logger.warning('scripted policy hit the episode chunk budget, giving up')
@@ -245,6 +303,9 @@ class PickStateMachine:
             'place': self._place,
             'release': self._release,
             'retract': self._retract,
+            'drawer_approach': self._drawer_approach,
+            'drawer_grasp': self._drawer_grasp,
+            'drawer_act': self._drawer_act,
             'done': self._done,
         }[self.state]
         return handler(observation, ee, steps)
@@ -255,10 +316,28 @@ class PickStateMachine:
         self.rotation = normalize_quat(ee[3:])
         self.origin_xy = ee[:2].copy()
         self.origin_z = float(ee[2])
-        self.color, self.want_place = parse_task(str(observation.get(TASK, '')))
-        logger.info('scripted policy: task=%r color=%s place=%s descriptor=%r',
-                    str(observation.get(TASK, '')), self.color, self.want_place,
-                    str(observation.get(DESCRIPTOR, '')))
+        task = str(observation.get(TASK, ''))
+        intent = parse_task_text(task)
+        self.color = intent['color']  # None unless the task names a vision-known colour
+        logger.info('scripted policy: task=%r intent=%s descriptor=%r',
+                    task, intent, str(observation.get(DESCRIPTOR, '')))
+        skill = intent['skill']
+        if skill == 'give_up':
+            logger.warning('scripted policy: task %r is outside the task grammar, giving up', task)
+            return self._chunk(ee, ee, self._grip_of(observation), steps, 'give_up')
+        if skill in ('open_drawer', 'close_drawer'):
+            self.drawer_mode = 'open' if skill == 'open_drawer' else 'close'
+            self.want_place = False
+            self.place_target = intent['target']
+            self.handle_xy = self.origin_xy + np.array([HANDLE_FORWARD, 0.0])
+            self.handle_z = self.origin_z - HANDLE_HEIGHT_DROP
+            self.drawer_phase = 'lateral'
+            self.state = 'drawer_approach'
+            logger.info('scripted policy: drawer skill mode=%s handle=%s z=%.3f',
+                        self.drawer_mode, self.handle_xy, self.handle_z)
+            return self._drawer_approach(observation, ee, steps)
+        self.want_place = skill in (SKILL_PLACE, SKILL_MOVE_DIR)
+        self.place_target = intent['target']
         self.state = 'servo'
         return self._servo(observation, ee, steps)
 
@@ -359,8 +438,126 @@ class PickStateMachine:
         logger.warning('scripted policy: grasp failed after %d retries, giving up', GRASP_RETRIES)
         return self._chunk(ee, ee, 0.0, steps, 'give_up')
 
+    # -- drawer skill (open_drawer / close_drawer from the task grammar) ---
+
+    def _drawer_approach(self, observation: dict[str, Any], ee: np.ndarray, steps: int) -> list[dict[str, Any]]:
+        """Cruise to the nominal handle point, then descend to handle height.
+
+        The nominal point is blind (+HANDLE_FORWARD on x). If the wrist camera happens to
+        centre a blob while cruising, that neighbourhood is adopted as the handle instead
+        — vision refines, but never blocks (detect_blob_soft).
+        """
+        blob = detect_blob_soft(observation.get(WRIST_IMAGE), None)
+        if self.drawer_phase == 'lateral' and blob is not None and blob[2] > 0.02 \
+                and abs(blob[0]) < CENTER_TOL and abs(blob[1]) < CENTER_TOL:
+            self.handle_xy = ee[:2].copy()
+            self.drawer_phase = 'vertical'
+            logger.info('scripted policy: adopting wrist blob neighbourhood as the handle')
+        if self.drawer_phase == 'lateral':
+            if float(np.linalg.norm(ee[:2] - self.handle_xy)) < 0.02:
+                self.drawer_phase = 'vertical'
+            else:
+                target = self._pose_target(np.array([*self.handle_xy, self.origin_z]))
+                return self._chunk(ee, self._clamped(ee, target, MAX_XY_STEP), 0.0, steps, None)
+        # vertical phase
+        if abs(ee[2] - self.handle_z) < 0.02:
+            self.hold_run = 0
+            self.state = 'drawer_grasp'
+            return self._drawer_grasp(observation, ee, steps)
+        target = self._pose_target(np.array([*self.handle_xy, self.handle_z]))
+        return self._chunk(ee, self._clamped(ee, target, MAX_Z_STEP), 0.0, steps, None)
+
+    def _drawer_grasp(self, observation: dict[str, Any], ee: np.ndarray, steps: int) -> list[dict[str, Any]]:
+        """Hold still, close the gripper on the handle, then arm the pull/push direction."""
+        self.hold_run += 1
+        if self.hold_run < GRASP_HOLD_CHUNKS:
+            target = self._pose_target(np.array([*self.handle_xy, self.handle_z]))
+            return self._chunk(ee, self._clamped(ee, target, MAX_Z_STEP), 1.0, steps, None)
+        grip_obs = self._grip_of(observation)
+        if grip_obs < 0.92:  # fingers stopped: the handle is inside
+            # Drawer axis assumed along the start->handle line: pull toward the robot to
+            # open, push away to close (the same blind +X forward guess as CARRY_OFFSET).
+            approach = self.handle_xy - self.origin_xy
+            approach = approach / max(1e-6, float(np.linalg.norm(approach)))
+            self.pull_dir = -approach if self.drawer_mode == 'open' else approach
+            self.pull_start = ee[:2].copy()
+            self.stall_run = 0
+            self.drawer_steps = 0
+            self.prev_drawer_xy = ee[:2].copy()
+            self.state = 'drawer_act'
+            logger.info('scripted policy: drawer handle grasped (grip=%.2f), mode=%s pull_dir=%s',
+                        grip_obs, self.drawer_mode, self.pull_dir)
+            return self._drawer_act(observation, ee, steps)
+        if self.drawer_regrasps < DRAWER_REGRASP:
+            self.drawer_regrasps += 1
+            self.hold_run = 0
+            logger.info('scripted policy: drawer grasp failed (grip=%.2f), re-grasping', grip_obs)
+            return self._chunk(ee, ee, 0.0, steps, None)  # open and try closing again
+        logger.warning('scripted policy: drawer handle never grasped, giving up')
+        return self._chunk(ee, ee, 0.0, steps, 'give_up')
+
+    def _drawer_act(self, observation: dict[str, Any], ee: np.ndarray, steps: int) -> list[dict[str, Any]]:
+        """Pull/push along the drawer axis in DRAWER_STEP bites with stall detection.
+
+        End-of-travel signal: |dq| collapse when the rig provides ``robot_state.dq``,
+        commanded-vs-achieved position stall otherwise. Grip guard: fully-closed fingers
+        mean the handle slipped out.
+        """
+        self.drawer_steps += 1
+        grip_obs = self._grip_of(observation)
+        if grip_obs > 0.95 and self.drawer_steps > 1:
+            if self.drawer_regrasps < DRAWER_REGRASP:
+                self.drawer_regrasps += 1
+                self.hold_run = 0
+                self.state = 'drawer_grasp'
+                logger.info('scripted policy: lost the drawer handle (grip=%.2f), re-grasping', grip_obs)
+                return self._drawer_grasp(observation, ee, steps)
+            logger.warning('scripted policy: lost the drawer handle with no retries left, giving up')
+            return self._chunk(ee, ee, 1.0, steps, 'give_up')
+        target_xy = ee[:2] + self.pull_dir * DRAWER_STEP
+        target = self._pose_target(np.array([*target_xy, self.handle_z]))
+        chunk = self._chunk(ee, self._clamped(ee, target, DRAWER_STEP), 1.0, steps, None)
+        stalled = False
+        if self.drawer_steps > 2:  # let commanded motion start before judging it
+            dq_value = observation.get(DQ)
+            if dq_value is not None:
+                dq_norm = float(np.linalg.norm(np.asarray(dq_value, dtype=np.float64).reshape(-1)))
+                stalled = dq_norm < DQ_STALL_NORM
+                self.stall_run = self.stall_run + 1 if stalled else 0
+            else:
+                stalled = self.prev_drawer_xy is not None \
+                    and float(np.linalg.norm(ee[:2] - self.prev_drawer_xy)) < EE_STALL_MOVE
+                self.stall_run = self.stall_run + 1 if stalled else 0
+        self.prev_drawer_xy = ee[:2].copy()
+        end_of_travel = self.stall_run >= STALL_CHUNKS
+        budget_spent = self.drawer_steps >= DRAWER_ACT_BUDGET
+        if end_of_travel or budget_spent:
+            progress = float(np.dot(ee[:2] - self.pull_start, self.pull_dir))
+            logger.info('scripted policy: drawer %s stopping (stall=%d/%d budget=%s progress=%.3f m)',
+                        self.drawer_mode, self.stall_run, STALL_CHUNKS, budget_spent, progress)
+            if self.drawer_mode == 'open' and progress < 0.02:
+                logger.warning('scripted policy: drawer never moved; open failed, giving up')
+                return self._chunk(ee, ee, 1.0, steps, 'give_up')
+            self.hold_run = 0
+            self.state = 'hold_after_task'  # hold the final pose for the judge, then complete
+            return self._hold_after_task(observation, ee, steps)
+        return chunk
+
+    def _container_target(self) -> bool:
+        """True when the parsed place relation names a container (release from above)."""
+        target = self.place_target or ''
+        if target.startswith('into-'):
+            return target[5:] in CONTAINERS
+        if target.startswith('from-to:'):
+            parts = target.split(':')
+            return len(parts) > 2 and parts[2] in CONTAINERS
+        return False
+
     def _lift(self, observation: dict[str, Any], ee: np.ndarray, steps: int) -> list[dict[str, Any]]:
         z_target = self.grasp_z + LIFT_HEIGHT
+        if self.want_place and self._container_target():
+            # into-container means releasing above the vessel mouth, not at table height.
+            z_target = max(z_target, self.origin_z - BIN_RELEASE_DROP)
         if ee[2] < z_target - 0.01:
             target = self._pose_target(np.array([*self.grasp_xy, z_target]))
             return self._chunk(ee, self._clamped(ee, target, MAX_Z_STEP), 1.0, steps, None)
@@ -379,18 +576,63 @@ class PickStateMachine:
             return self._chunk(ee, ee, self._grip_of(observation), steps, None)
         return self._chunk(ee, ee, self._grip_of(observation), steps, 'complete')
 
+    def _place_plan(self) -> tuple[np.ndarray | None, float | None]:
+        """Drop geometry from the parsed relation: (drop_xy, place_z), or (None, None) legacy.
+
+        Blind priors, all honestly documented: containers are reached at the legacy carry
+        offset, the table height is the descend floor, screen left/right maps to ±y (the
+        world axis is unresolvable without camera extrinsics), and into-container targets
+        release above the mouth instead of descending into the vessel.
+        """
+        target = self.place_target or ''
+        carry_xy = self.grasp_xy + np.array(CARRY_OFFSET)
+        table_z = self.origin_z - FLOOR_DROP
+        if target in ('left', 'right') or target.startswith(('left-of:', 'right-of:')):
+            sign = 1.0 if target.startswith(('left', 'left-of:')) else -1.0
+            return self.grasp_xy + np.array([0.0, PLACE_LATERAL * sign]), table_z
+        if target.startswith('from-to:'):
+            parts = target.split(':')
+            to_noun = parts[2] if len(parts) > 2 else ''
+            if to_noun in CONTAINERS:
+                return carry_xy, max(self.grasp_z, self.origin_z - BIN_RELEASE_DROP)
+            if to_noun in SURFACES:
+                return carry_xy, table_z
+            return carry_xy, table_z
+        if target.startswith('into-'):
+            noun = target[5:]
+            if noun in CONTAINERS:
+                return carry_xy, max(self.grasp_z, self.origin_z - BIN_RELEASE_DROP)
+            return carry_xy, table_z  # 'into' an unknown noun: table-height best effort
+        if target.startswith('onto-'):
+            noun = target[5:]
+            z = table_z + (PLATE_HEIGHT if noun in ('plate', 'pot', 'pan', 'tray') else 0.0)
+            return carry_xy, z
+        if target.startswith('beside:'):
+            return carry_xy, table_z
+        return None, None
+
     def _carry(self, observation: dict[str, Any], ee: np.ndarray, steps: int) -> list[dict[str, Any]]:
-        drop_xy = self.grasp_xy + np.array(CARRY_OFFSET)
-        drop_xy = np.clip(drop_xy, self.origin_xy - 0.6, self.origin_xy + 0.6)
-        if float(np.linalg.norm(ee[:2] - drop_xy)) > 0.02:
-            target = self._pose_target(np.array([*drop_xy, ee[2]]))
+        if self.drop_xy is None:
+            drop_xy, place_z = self._place_plan()
+            if drop_xy is None:  # no parsed relation: legacy blind offset
+                drop_xy, place_z = self.grasp_xy + np.array(CARRY_OFFSET), None
+            self.drop_xy = np.clip(drop_xy, self.origin_xy - 0.6, self.origin_xy + 0.6)
+            self.place_z = place_z
+            logger.info('scripted policy: place plan target=%r drop_xy=%s place_z=%s',
+                        self.place_target, self.drop_xy, self.place_z)
+        if float(np.linalg.norm(ee[:2] - self.drop_xy)) > 0.02:
+            target = self._pose_target(np.array([*self.drop_xy, ee[2]]))
             return self._chunk(ee, self._clamped(ee, target, MAX_XY_STEP), 1.0, steps, None)
         self.hold_run = 0
         self.state = 'place'
         return self._place(observation, ee, steps)
 
     def _place(self, observation: dict[str, Any], ee: np.ndarray, steps: int) -> list[dict[str, Any]]:
-        z = max(self.origin_z - FLOOR_DROP, ee[2] - PLACE_DEPTH)
+        if self.place_z is not None:
+            # Relation-planned height; release above it (into-container never descends).
+            z = min(self.place_z, ee[2])
+        else:
+            z = max(self.origin_z - FLOOR_DROP, ee[2] - PLACE_DEPTH)  # legacy blind descend
         if ee[2] > z + 0.01:
             target = self._pose_target(np.array([*ee[:2], z]))
             return self._chunk(ee, self._clamped(ee, target, MAX_Z_STEP), 1.0, steps, None)
