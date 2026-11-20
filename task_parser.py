@@ -69,16 +69,22 @@ for _v in UNSUPPORTED_VERBS:
     VERB_MAP[_v] = _v
 
 # Object dictionary (canonical names). Synonyms map into canon via OBJECT_SYNONYMS.
+# Furniture/appliance nouns are needed so open/close tasks keep their real target object
+# (submission-3 log: 'open the dresser/refrigerator/oven/dishwasher/cabinet/fridge') —
+# scripted_policy classifies the open pull direction (slide vs hinged door) from it.
 OBJECTS = {
     'spoon', 'fork', 'knife', 'cup', 'cube', 'box', 'bin', 'basket', 'bowl', 'plate',
     'pot', 'pan', 'bottle', 'marker', 'pen', 'banana', 'apple', 'towel', 'drawer',
     'lid', 'ball', 'can', 'sponge', 'cheezit', 'mustard', 'ketchup', 'toy', 'chip',
     'cubelet', 'table', 'counter', 'desk', 'surface', 'shelf',
+    'dresser', 'cabinet', 'cupboard', 'door', 'oven', 'dishwasher', 'refrigerator',
+    'wardrobe', 'freezer', 'microwave',
 }
 OBJECT_SYNONYMS = {
     'mug': 'cup', 'glass': 'cup', 'block': 'cube', 'pencil': 'pen', 'cloth': 'towel',
     'bandage': 'towel', 'container': 'box', 'trash': 'bin', 'garbage': 'bin',
     'tray': 'plate', 'skillet': 'pan', 'cracker': 'cheezit', 'fruit': 'apple',
+    'fridge': 'refrigerator',
 }
 # Nouns the FSM may release into/from above (place target 'into-<noun>').
 CONTAINERS = {'box', 'bin', 'basket', 'bowl', 'cup', 'pot', 'pan', 'drawer', 'can'}
@@ -92,7 +98,10 @@ OTHER_COLORS = ('orange', 'purple', 'pink', 'black', 'white', 'brown', 'gray', '
 COLORS = set(VISION_COLORS) | set(OTHER_COLORS)
 
 # Words that never mean anything by themselves: articles, pronouns, particles,
-# size/position modifiers, verb particles (pick **up**, set **down**).
+# size/position modifiers, verb particles (pick **up**, set **down**). The material/
+# appearance adjectives ('wooden', 'dark', 'tall', …) come from the real catalog texts
+# (submission-3 log: 'open the tall dark refrigerator', 'close the light brown table') —
+# without them _noun_at stops before the noun and open/close tasks lose their object.
 _SKIP = {
     'the', 'a', 'an', 'it', 'its', 'them', 'that', 'this', 'there', 'up', 'down',
     'wide', 'top', 'bottom', 'upper', 'lower', 'middle', 'small', 'big', 'large',
@@ -100,6 +109,7 @@ _SKIP = {
     'slowly', 'gently', 'again', 'here', 'away', 'back', 'out', 'of', 'to', 'from',
     'onto', 'into', 'inside', 'within', 'on', 'in', 'at', 'by', 'with', 'beside',
     'next', 'left', 'right', 'of', 'for', 'off',
+    'wooden', 'dark', 'light', 'tall', 'metal', 'plastic', 'narrow', 'long', 'short',
 }
 
 
