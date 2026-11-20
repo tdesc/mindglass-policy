@@ -1,0 +1,12 @@
+# Server wire (protocol v3) + transport extras.
+# NOTE: the reference clone (Positronic-Robotics/positronic main) pins 0.3.8, which is
+# not on PyPI yet — the latest published release is 0.3.7. Verified by diffing the
+# installed 0.3.7 distribution against the clone: the public API (ModelServer/Model/
+# Session/spec/serialization/websocket wire/protocol fields) is identical; 0.3.8 adds
+# only timing-telemetry fields (received_ns/sent_ns/encode_ms). Bump to 0.3.8 when it
+# is published.
+positronic-model-server[websocket]==0.3.7
+# Wrist-camera blob detection (HSV segmentation + connected components).
+opencv-python-headless==5.1.0.95
+# msgpack, numpy, pillow, websockets, uvicorn come from the line above — verified
+# locally on Python 3.11 / numpy 2.4.6; nothing else is imported at runtime.
