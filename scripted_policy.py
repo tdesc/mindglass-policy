@@ -233,6 +233,8 @@ class PickStateMachine:
         self.pull_start = np.zeros(2)
         self.drawer_regrasps = 0
         self.drawer_steps = 0
+        self.safety_fallbacks = 0
+        self.last_good_ee = None
         self.stall_run = 0
         self.prev_drawer_xy: np.ndarray | None = None
 
@@ -275,6 +277,38 @@ class PickStateMachine:
         # Platform hardening (submission 6482ea4f… robolab episode): a chunk with
         # zero elements is unusable for the client — never emit one.
         steps = max(1, int(steps))
+        observation = self._sanitise(observation)
+        try:
+            return self._step_inner(observation, fps, steps)
+        except Exception as exc:  # never let the client see an error response
+            logger.warning('policy step failed (%s: %s), serving safe hold', type(exc).__name__, exc)
+            self.safety_fallbacks += 1
+            ee = self._safe_ee(observation)
+            end = 'give_up' if self.safety_fallbacks > 10 else None
+            return self._chunk(ee, ee, self._grip_of(observation), steps, end)
+
+    def _safe_ee(self, observation: dict[str, Any]) -> np.ndarray:
+        # last good pose, else the deterministic home pose
+        if getattr(self, 'last_good_ee', None) is not None:
+            return self.last_good_ee
+        return np.array([0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0])
+
+    def _sanitise(self, observation: dict[str, Any]) -> dict[str, Any]:
+        # repair observations a sim can deliver mid-episode (NaN pose, empty frame)
+        obs = dict(observation)
+        ee = obs.get(EE_POSE)
+        if ee is not None:
+            ee = np.asarray(ee, dtype=np.float64).reshape(-1)
+            if not np.isfinite(ee).all():
+                obs[EE_POSE] = self._safe_ee(obs).astype(np.float32)
+            else:
+                self.last_good_ee = ee.astype(np.float64)
+        img = obs.get(WRIST_IMAGE)
+        if img is None or not hasattr(img, 'shape') or len(getattr(img, 'shape', ()) or ()) != 3 or img.shape[0] < 8 or img.shape[1] < 8:
+            obs[WRIST_IMAGE] = np.zeros((360, 640, 3), dtype=np.uint8)
+        return obs
+
+    def _step_inner(self, observation: dict[str, Any], fps: float, steps: int) -> list[dict[str, Any]]:
         self.chunk_count += 1
         if self.chunk_count > EPISODE_BUDGET:
             logger.warning('scripted policy hit the episode chunk budget, giving up')
