@@ -1495,6 +1495,13 @@ class PickAndPlaceModel(Model):
                 # it should send with (positronic/policy/remote.py:231, 239-240).
                 'compress_images': bool(compress_images),
                 'jpeg_quality': int(jpeg_quality),
+                # RoboLab harness reads ee_frames from the session metadata (v3):
+                # poses are stated at the rig's gripper site (roboarm models.py:25
+                # GRIPPER_SITE = 'gripper'), zero offset.
+                'ee_frames': {
+                    'robot_state.ee_pose': {'site': 'gripper', 'offset': [0.0, 0.0, 0.0]},
+                    'robot_command.pose': {'site': 'gripper', 'offset': [0.0, 0.0, 0.0]},
+                },
             },
         )
 
@@ -1508,8 +1515,8 @@ class PickAndPlaceModel(Model):
         # Both signals sit at the rig's end_effector site, zero offset.
         return {
             'ee_frames': {
-                'robot_state.ee_pose': {'site': 'end_effector', 'offset': [0.0, 0.0, 0.0]},
-                'robot_command.pose': {'site': 'end_effector', 'offset': [0.0, 0.0, 0.0]},
+                'robot_state.ee_pose': {'site': 'gripper', 'offset': [0.0, 0.0, 0.0]},
+                'robot_command.pose': {'site': 'gripper', 'offset': [0.0, 0.0, 0.0]},
             },
         }
 
