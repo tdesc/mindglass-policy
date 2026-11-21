@@ -90,6 +90,8 @@ OBJECT_SYNONYMS = {
 CONTAINERS = {'box', 'bin', 'basket', 'bowl', 'cup', 'pot', 'pan', 'drawer', 'can'}
 # Surfaces/calm targets ('onto-<noun>', blind table height).
 SURFACES = {'table', 'counter', 'plate', 'tray', 'pot', 'pan', 'desk', 'surface', 'shelf'}
+# Flat surfaces an open/close command must NOT address (sponsor ban: the table).
+FLAT_SURFACES = {'table', 'counter', 'desk', 'surface'}
 # Objects an open/close command can legitimately address (everything else gives up).
 OPENABLES = {'drawer', 'box', 'cupboard', 'cabinet', 'fridge', 'refrigerator', 'storage', 'laptop', 'book', 'bottle', 'lid'}
 
@@ -252,10 +254,12 @@ def parse_task_text(task: str) -> dict[str, Any]:
     # -- skill decision --------------------------------------------------------
     if verb in DRAWER_OPEN_VERBS or verb in DRAWER_CLOSE_VERBS:
         # Affordance guard (submission-4 log: 'close the table' burned 129 chunks in
-        # drawer_probe): open/close only applies to openable objects; anything else
-        # (a table, a surface) is honestly unsupported.
-        openable = object_name in OPENABLES or object_name in (None, 'drawer', 'box', 'fridge', 'refrigerator')
-        if not openable:
+        # drawer_probe). Sponsor correction 2026-11-21: the ban covers ONLY flat
+        # non-openable surfaces (table/counter/desk/surface/shelf); every other noun —
+        # including dresser/oven/dishwasher — routes into the existing drawer/door
+        # branches, where HINGED_OBJECTS already splits slide vs hinge geometry.
+        not_openable = object_name in FLAT_SURFACES
+        if not_openable:
             skill = SKILL_GIVE_UP
         elif verb in DRAWER_OPEN_VERBS:
             skill = SKILL_OPEN_DRAWER

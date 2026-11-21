@@ -1627,6 +1627,10 @@ class PickSession(Session):
         # camera (wrist + two exterior), downscaled and base64-encoded into the policy
         # log, so the detection can finally be tuned against the platform's actual
         # renders. The randomized exterior left/right order is visible in the dump.
+        # OFF by default (sponsor: the log would carry the raw JPEGs even when the
+        # fingerprint trace is disabled) — enable locally with POLICY_LOG_FRAMES=1.
+        if not os.environ.get('POLICY_LOG_FRAMES'):
+            return
         if self._frame_logged:
             return
         self._frame_logged = True
