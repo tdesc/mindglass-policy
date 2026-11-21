@@ -880,7 +880,7 @@ class PickStateMachine:
         detection path untouched.
         """
         blob = detect_blob_soft(observation.get(WRIST_IMAGE), None)
-        if blob is None and self.drawer_mode == 'open':
+        if blob is None and self.drawer_mode in ('open', 'close'):
             candidates = detect_candidates_soft(observation.get(WRIST_IMAGE))
             if candidates:
                 blob = candidates[0]
@@ -976,13 +976,14 @@ class PickStateMachine:
             self.drawer_search['stage'] = 0
             self.state = 'drawer_probe'
             return self._drawer_probe(observation, ee, steps)
-        if self.drawer_mode == 'open':
-            # Open mode falls back to the contact search before giving up: the blind
-            # nominal point can be occupied by other scenery entirely (gate round 1:
-            # it false-grasped the place box while the drawer sat 0.30 m to the side).
-            # Close mode keeps its original blind path untouched (the lane constraint).
+        if True:
+            # BOTH modes fall back to the contact search before giving up: the blind
+            # nominal point can be occupied by other scenery entirely (gate round 1)
+            # or — close-after-open on the polygon (composite 2026-11-21) — sit 5-13 cm
+            # beyond the blind nominal point. The act states branch pull/push by
+            # drawer_mode, so the shared search serves both directions.
             logger.warning('scripted policy: drawer handle never grasped blind (grip=%.2f); '
-                           'starting the open-mode contact search', grip_obs)
+                           'starting the contact search', grip_obs)
             self._start_drawer_search()
             return self._drawer_sweep(observation, ee, steps)
         logger.warning('scripted policy: drawer handle never grasped, giving up')
