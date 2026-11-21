@@ -90,6 +90,8 @@ OBJECT_SYNONYMS = {
 CONTAINERS = {'box', 'bin', 'basket', 'bowl', 'cup', 'pot', 'pan', 'drawer', 'can'}
 # Surfaces/calm targets ('onto-<noun>', blind table height).
 SURFACES = {'table', 'counter', 'plate', 'tray', 'pot', 'pan', 'desk', 'surface', 'shelf'}
+# Objects an open/close command can legitimately address (everything else gives up).
+OPENABLES = {'drawer', 'box', 'cupboard', 'cabinet', 'fridge', 'refrigerator', 'storage', 'laptop', 'book', 'bottle', 'lid'}
 
 # Colour words. The first four are the vision-supported HSV set (scripted_policy.COLOR_RANGES);
 # the rest parse as colours but the FSM treats them as "no known colour" (largest-blob search).
@@ -248,12 +250,19 @@ def parse_task_text(task: str) -> dict[str, Any]:
     object_color_or_type = color_out or object_name
 
     # -- skill decision --------------------------------------------------------
-    if verb in DRAWER_OPEN_VERBS:
-        skill = SKILL_OPEN_DRAWER
-        target = 'drawer-open'
-    elif verb in DRAWER_CLOSE_VERBS:
-        skill = SKILL_CLOSE_DRAWER
-        target = 'drawer-close'
+    if verb in DRAWER_OPEN_VERBS or verb in DRAWER_CLOSE_VERBS:
+        # Affordance guard (submission-4 log: 'close the table' burned 129 chunks in
+        # drawer_probe): open/close only applies to openable objects; anything else
+        # (a table, a surface) is honestly unsupported.
+        openable = object_name in OPENABLES or object_name in (None, 'drawer', 'box', 'fridge', 'refrigerator')
+        if not openable:
+            skill = SKILL_GIVE_UP
+        elif verb in DRAWER_OPEN_VERBS:
+            skill = SKILL_OPEN_DRAWER
+            target = 'drawer-open'
+        else:
+            skill = SKILL_CLOSE_DRAWER
+            target = 'drawer-close'
     elif verb in UNSUPPORTED_VERBS:
         skill = SKILL_GIVE_UP  # recognized, honestly unsupported
     else:

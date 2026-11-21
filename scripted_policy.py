@@ -20,8 +20,13 @@ minus timing-telemetry fields):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
+import os
+import uuid
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -40,6 +45,8 @@ EE_POSE = 'robot_state.ee_pose'  # float32(7): x, y, z, qw, qx, qy, qz (wxyz sca
 STATUS = 'robot_state.status'  # int scalar: 0 available, 1 busy, 3 error
 GRIP = 'grip'  # float scalar in [0, 1]: 0 open, 1 closed
 WRIST_IMAGE = 'image.wrist'  # uint8 (H, W, 3) RGB
+EXTERIOR_IMAGE = 'image.exterior'  # uint8 (H, W, 3) RGB
+EXTERIOR2_IMAGE = 'image.exterior_2'  # uint8 (H, W, 3) RGB
 TASK = 'task'  # str
 DESCRIPTOR = 'descriptor'  # str, e.g. 'mujoco.franka'
 
@@ -91,7 +98,9 @@ RELEASE_HOLD_CHUNKS = 2
 RETRACT_HEIGHT = 0.08
 HOLD_AFTER_TASK_BUDGET = 30  # chunks to keep serving a finished task before ending 'complete'
 ERROR_BUDGET = 6  # consecutive error-status chunks before give_up
-EPISODE_BUDGET = 128  # chunks total, safety net against a livelock (the adapter caps at 130;
+EPISODE_BUDGET = 400  # chunks total; the drawer pipeline (sweep + probe walk + grasp) needs
+                      # ~240-300 — 128 starved it mid-grasp (submission #4 log: sweep 110 + probe 7 +
+                      # grasp 2, then the safety net fired). Picks finish in ~25 chunks, harmless.
                       # the open-mode blind attempt + vision search needs the headroom)
 
 # --- closed-loop gain-sign calibration (replaces the flip heuristic, FIX-2) ----------
@@ -151,12 +160,14 @@ SWEEP_RIDE_Z = 0.005       # metres of actual TCP above the commanded drag heigh
 GRIP_AIR_MARGIN_STOP = 0.15  # grip below (measured air closure - this) while dragging = contact
 GRIP_AIR_MARGIN_HELD = 0.08  # grip below (air - this) at the hold check = fingers stopped on object
 GRIP_AIR_MARGIN_LOST = 0.05  # grip within (air - this) of full closure = slipped/empty
-PROBE_DX_OPEN = (-0.15, -0.12)  # open mode: the drawer starts shut, the handle sits at the
-                           # front face, ~0.15 toward the robot of the contacted body top
+PROBE_DX_OPEN = (-0.15, -0.12, -0.20, -0.25)  # open mode: the drawer starts shut; the
+                           # handle sits at the front face, ~0.15 toward the robot of the
+                           # contacted body top (polygon probe round 1: the grid stopped
+                           # 0.04-0.06 m short of the handle truth (0.365, -0.30) — extended)
 PROBE_DX_CLOSE = (-0.25, -0.20, -0.15)  # close mode: the drawer starts pulled OUT, so the
                            # handle slides this much further toward the robot (the slide
                            # travel), and the probe grid must span the whole travel
-PROBE_DY = (0.08, 0.11, 0.05)  # …and BEYOND the contact along the drag direction: the first
+PROBE_DY = (0.08, 0.11, 0.05, 0.16, 0.21)  # …and BEYOND the contact along the drag direction: the first
                            # contact is the cabinet's side wall, and the handle sits just
                            # past that wall (the bin half-width), +-0.03 of uncertainty
 DRAWER_PROBE_Z_DROP = 0.02  # metres BELOW the nominal handle height the probe grasps at:
@@ -1439,6 +1450,153 @@ def build_client_stack(*, fps: float, horizon_sec: float | None, compress_images
     return sequence(*parts)
 
 
+# ---------------------------------------------------------------------------
+# Fingerprint-only wire observer (kit pattern: golem experiments/franka_golem_glass/
+# wire_glass.py:16-103, kit #3 of 2026-11-21). Records what the client actually sent
+# and what this session answered WITHOUT raw pixels and without any credential:
+# images become {shape, dtype, sha256-of-bytes}, poses/commands become plain numbers.
+# Rows carry schema golem.franka.v3_observer.v1, at most WIRE_TRACE_CAP calls per
+# session, status successor_observed / no_successor_observed, and always
+# execution_acknowledged=False / motor_authority=False — a receipt never certifies
+# that the platform executed a command (ADR-256 law 1: receipts are observations).
+# Deviation from the kit, stated: wire_glass.py disables the whole trace on the first
+# non-JSON-safe number (ValueError path); here non-finite numbers are recorded as
+# their marker strings ('nan'/'inf') so the receipt survives the exact anomalies a
+# robolab diagnosis needs, while receipt_id stays verifiable (digest of canonical
+# JSON, allow_nan=False).
+# ---------------------------------------------------------------------------
+
+WIRE_TRACE_SCHEMA = 'golem.franka.v3_observer.v1'
+WIRE_TRACE_ENV_VARS = ('POLICY_WIRE_TRACE_DIR', 'FRANKA_GLASS_TRACE_DIR')
+WIRE_TRACE_CAP = 256
+_WIRE_TRACE_ERRORS = (OSError, ValueError, TypeError, KeyError)
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, allow_nan=False,
+                      separators=(',', ':')).encode('utf-8')
+
+
+def _digest(value: Any) -> str:
+    return 'sha256:' + hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _jsonable(value: Any) -> Any:
+    """JSON-safe copy that never hides a non-finite number (marker strings instead)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, list):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def _fingerprint_observation(observation: Any) -> dict[str, Any]:
+    """The observation as fingerprints only: shapes+hashes for frames, numbers for poses."""
+    view: dict[str, Any] = {}
+    if not isinstance(observation, dict):
+        view['observation_type'] = type(observation).__name__
+        return view
+    for key in sorted(name for name in observation if name.startswith('image.')):
+        frame = np.asarray(observation[key])
+        view[key] = {'shape': list(frame.shape), 'dtype': str(frame.dtype),
+                     'sha256': hashlib.sha256(frame.tobytes()).hexdigest()}
+    for key in (EE_POSE, STATUS, GRIP):
+        if key in observation:
+            view[key] = _jsonable(np.asarray(observation[key]).tolist())
+    for key in (TASK, DESCRIPTOR):
+        value = observation.get(key)
+        if isinstance(value, str):
+            view[key] = value[:200]
+        elif value is not None:
+            view[key] = repr(value)[:200]
+    return view
+
+
+class WireObserver:
+    """One served session's wire receipt; every method fails silent (never raises)."""
+
+    def __init__(self, file: Any = None, session: str | None = None):
+        self.file = file
+        self.session = session
+        self._current: dict[str, Any] | None = None
+        self._pending: dict[str, Any] | None = None
+        self._calls = 0
+
+    @classmethod
+    def optional(cls) -> 'WireObserver':
+        directory = next((os.environ[name] for name in WIRE_TRACE_ENV_VARS
+                          if os.environ.get(name)), None)
+        if not directory:
+            return cls()
+        try:
+            dest = Path(directory)
+            dest.mkdir(parents=True, exist_ok=True)
+            session = uuid.uuid4().hex
+            return cls((dest / f'{session}.jsonl').open('x', encoding='utf-8'), session)
+        except OSError as exc:
+            logger.warning('wire trace unavailable (%s)', type(exc).__name__)
+        return cls()
+
+    def _disable(self, exc: Exception) -> None:
+        logger.warning('wire trace stopped (%s)', type(exc).__name__)
+        if self.file is not None:
+            try:
+                self.file.close()
+            except OSError:
+                pass
+        self.file = None
+
+    def _finish(self, after: dict[str, Any] | None) -> None:
+        if self._pending is None:
+            return
+        row: dict[str, Any] = {
+            'schema': WIRE_TRACE_SCHEMA, 'session': self.session, **self._pending,
+            'after': after,
+            'status': 'successor_observed' if after is not None else 'no_successor_observed',
+            'execution_acknowledged': False, 'motor_authority': False,
+        }
+        row['receipt_id'] = _digest(row)
+        self.file.write(json.dumps(row, separators=(',', ':'), allow_nan=False) + '\n')
+        self.file.flush()
+        self._pending = None
+
+    def see(self, observation: Any) -> None:
+        """Fingerprint the observation that just ARRIVED; close the previous call's row."""
+        if self.file is None:
+            return
+        try:
+            self._current = _fingerprint_observation(observation)
+            self._finish(self._current)
+            if self._calls >= WIRE_TRACE_CAP:
+                self.close()
+        except _WIRE_TRACE_ERRORS as exc:
+            self._disable(exc)
+
+    def emitted(self, chunk: Any) -> None:
+        """Pair the chunk this session is about to RETURN with the observation it saw."""
+        if self.file is None or self._current is None:
+            return
+        try:
+            commands = [{'action': _jsonable(np.asarray(item['action']).tolist()),
+                         'end': item.get('end')} for item in chunk]
+            self._calls += 1
+            self._pending = {'call': self._calls, 'before': self._current, 'commands': commands}
+            self._current = None
+        except _WIRE_TRACE_ERRORS as exc:
+            self._disable(exc)
+
+    def close(self) -> None:
+        """Last command without a following observation gets no_successor_observed."""
+        if self.file is None:
+            return
+        try:
+            self._finish(None)
+            self.file.close()
+            self.file = None
+        except _WIRE_TRACE_ERRORS as exc:
+            self._disable(exc)
+
+
 class PickSession(Session):
     """One episode: the state machine plus the resolved chunk geometry."""
 
@@ -1456,8 +1614,44 @@ class PickSession(Session):
         self._fps = float(fps)
         self._steps = int(steps)
         self._machine = PickStateMachine()
+        # Fingerprint-only wire trace (wire_glass.py pattern). Deliberately NOT exposed
+        # in session metadata: the wire surface the platform client sees stays byte-
+        # identical to the submission-6 image; the trace session id lives only in the
+        # trace file name and rows.
+        self._observer = WireObserver.optional()
+        self._frame_logged = False
+
+    def _log_first_frame(self, observation: Any) -> None:
+        # Vision calibration (Molmo Pick 0/204 diagnostics): the first frame of EVERY
+        # camera (wrist + two exterior), downscaled and base64-encoded into the policy
+        # log, so the detection can finally be tuned against the platform's actual
+        # renders. The randomized exterior left/right order is visible in the dump.
+        if self._frame_logged:
+            return
+        self._frame_logged = True
+        if not isinstance(observation, dict):
+            return
+        try:
+            import base64
+            import cv2
+            for key in (WRIST_IMAGE, EXTERIOR_IMAGE, EXTERIOR2_IMAGE):
+                img = observation.get(key)
+                if img is None or not hasattr(img, 'shape') or len(getattr(img, 'shape', ()) or ()) != 3 or img.shape[0] < 8 or img.shape[1] < 8:
+                    logger.warning('policy: %s frame unusable for calibration (shape %s)', key, getattr(img, 'shape', None))
+                    continue
+                h, w = img.shape[:2]
+                scale = min(1.0, 320.0 / max(h, 1))
+                small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale)))) if scale < 1.0 else img
+                ok, buf = cv2.imencode('.jpg', small[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if ok:
+                    logger.warning('policy: FRAME_B64 %s %s', key, base64.b64encode(buf.tobytes()).decode('ascii'))
+        except Exception as exc:
+            logger.warning('policy: frame logging skipped (%s: %.60s)', type(exc).__name__, exc)
 
     def infer(self, observation: Any) -> Any:
+        # The observer fingerprints the observation EXACTLY as it arrived, before any
+        # tolerance substitution, so a malformed client message is receipted verbatim.
+        self._observer.see(observation)
         # FIX-1: an inference error response is something the client "could not use"
         # (the platform's policy_inference_crash class) — never raise; missing keys fall
         # through to the machine's sanitiser and safe-hold path, which serve valid chunks.
@@ -1468,10 +1662,14 @@ class PickSession(Session):
         missing = [key for key in (EE_POSE, GRIP, WRIST_IMAGE, TASK) if key not in observation]
         if missing:
             logger.warning('policy: observation is missing %s; serving on the tolerant path', missing)
-        return self._machine.step(observation, self._fps, self._steps)
+        self._log_first_frame(observation)
+        chunk = self._machine.step(observation, self._fps, self._steps)
+        self._observer.emitted(chunk)
+        return chunk
 
     def close(self) -> None:
         self._machine = None
+        self._observer.close()
 
 
 class PickAndPlaceModel(Model):
